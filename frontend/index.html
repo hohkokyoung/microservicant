@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FileFlow — Event-Driven Upload Pipeline</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>FileFlow</h1>
+      <p class="tagline">Event-Driven File Processing Pipeline</p>
+    </div>
+  </header>
+
+  <main>
+    <section class="upload-section">
+      <div class="upload-card" id="dropzone">
+        <div class="upload-icon">&#8679;</div>
+        <p class="upload-label">Drop a file here or <label for="fileInput" class="browse-link">browse</label></p>
+        <p class="upload-hint">Any file up to 50 MB</p>
+        <input type="file" id="fileInput" hidden />
+      </div>
+
+      <div id="uploading-indicator" class="uploading-indicator hidden">
+        <div class="spinner"></div>
+        <span>Uploading to S3 &amp; publishing event&hellip;</span>
+      </div>
+    </section>
+
+    <section class="files-section">
+      <h2>Processing Queue</h2>
+      <p class="queue-hint">Results update automatically every 2 seconds.</p>
+      <div id="fileList" class="file-list"></div>
+      <p id="emptyState" class="empty-state">No files uploaded yet. Drop a file above to get started.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,106 @@
+services:
+  floci:
+    image: floci/floci:latest
+    ports:
+      - "4566:4566"
+    environment:
+      FLOCI_HOSTNAME: floci
+    volumes:
+      - floci-data:/app/data
+
+  setup:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./scripts:/app/scripts
+    environment:
+      AWS_ENDPOINT_URL: http://floci:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    command: >
+      sh -c "
+        cd /app/scripts &&
+        npm install @aws-sdk/client-s3@3 @aws-sdk/client-sns@3 @aws-sdk/client-sqs@3 @aws-sdk/client-dynamodb@3 --silent &&
+        node setup-infra.mjs
+      "
+    depends_on:
+      - floci
+    # no restart — runs once, exits 0 on success so workers can start
+
+  api:
+    build: ./services/api
+    ports:
+      - "3000:3000"
+    environment:
+      AWS_ENDPOINT_URL: http://floci:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:file-events
+      DYNAMODB_TABLE: file-processing
+    volumes:
+      - ./frontend:/app/frontend
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  virus-scanner:
+    build: ./services/virus-scanner
+    environment:
+      AWS_ENDPOINT_URL: http://floci:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      QUEUE_URL: http://floci:4566/000000000000/queue-virus-scanner
+      DYNAMODB_TABLE: file-processing
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  thumbnail-generator:
+    build: ./services/thumbnail-generator
+    environment:
+      AWS_ENDPOINT_URL: http://floci:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      QUEUE_URL: http://floci:4566/000000000000/queue-thumbnail-generator
+      DYNAMODB_TABLE: file-processing
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  metadata-indexer:
+    build: ./services/metadata-indexer
+    environment:
+      AWS_ENDPOINT_URL: http://floci:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      QUEUE_URL: http://floci:4566/000000000000/queue-metadata-indexer
+      DYNAMODB_TABLE: file-processing
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  storage-optimizer:
+    build: ./services/storage-optimizer
+    environment:
+      AWS_ENDPOINT_URL: http://floci:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      QUEUE_URL: http://floci:4566/000000000000/queue-storage-optimizer
+      DYNAMODB_TABLE: file-processing
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: on-failure
+
+volumes:
+  floci-data:
