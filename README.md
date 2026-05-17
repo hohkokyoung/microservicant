@@ -66,12 +66,14 @@ Upload a file through the web UI and watch four independent worker services proc
 │                                                                           │
 │  1. POST /api/upload                                                      │
 │  2. receives { fileId }                                                   │
-│  3. opens WebSocket connection → sends { fileId }                        │
-│  4. GET /api/status/:fileId once (get current state immediately)         │
-│  5. waits for WebSocket pushes (one per processor as they finish)        │
-│  6. closes WebSocket when overallStatus = complete                       │
-└──────┬─────────────────────────────────────────┬────────────────────────┘
-       │ POST /api/upload                         │ WebSocket connect
+│  3. GET /api/status/:fileId immediately (catch whatever is already done) │
+│  4. if complete → done, no WebSocket needed                              │
+│  5. if still processing → open WebSocket → send { fileId }              │
+│  6. receive pushes as remaining workers finish                           │
+│  7. close WebSocket when overallStatus = complete                        │
+└──────┬──────────────────────────────┬──────────────────┬────────────────┘
+       │ POST /api/upload             │ GET /status      │ WebSocket connect
+       │                              │ (catch up first) │ (then watch remaining)
        ▼                                          ▼
 ┌──────────────────────────────────────────────────────┐
 │                  API Service :3000                    │
