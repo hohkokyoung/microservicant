@@ -252,4 +252,170 @@ This system uses simulated processing (mocked results). To make it production-re
 | Metadata Indexer | Apache Tika or cloud vision API |
 | Storage Optimizer | Node.js `zlib` (Brotli/gzip) |
 
-For real-time status updates, replace browser polling with **WebSocket + Redis Pub/Sub** — workers publish to a Redis channel on completion, backend pushes to browser instantly via WebSocket.
+---
+
+## Improvements & Scaling
+
+### 1. Real-Time Updates — WebSocket + Redis Pub/Sub
+
+The current system uses **browser polling** — the frontend asks `GET /api/status/:fileId` every 2 seconds. This works but has two problems:
+
+- Up to 2 second delay between a worker finishing and the UI updating
+- Constant unnecessary requests even when nothing has changed
+
+**The improvement:** Replace polling with WebSocket for instant push updates.
+
+```
+Current (polling):
+  worker finishes → writes DynamoDB → browser polls 2s later → UI updates
+
+Improved (WebSocket):
+  worker finishes → writes DynamoDB → pushes instantly → UI updates immediately
+```
+
+#### Why this breaks at multiple API servers
+
+A single WebSocket connection is tied to one server instance. When you scale the API to multiple instances:
+
+```
+Browser connects WebSocket to Server 1
+Worker finishes, happens to notify Server 2
+Server 2 has no record of this browser connection
+Browser never receives the update ❌
+```
+
+Each server only knows about browsers connected to itself — there is no shared knowledge across instances.
+
+#### The fix — Redis Pub/Sub as the cross-server bridge
+
+Redis Pub/Sub acts as a shared message channel all servers subscribe to:
+
+```
+Browser ──WebSocket──► Server 1
+                         │ subscribe "file:abc-123"
+                         ▼
+                       Redis
+                         ▲
+Worker finishes          │ publish "file:abc-123" { processor, status }
+  → write DynamoDB       │
+  → redis.publish ───────┘
+
+Redis delivers to all subscribers:
+  → Server 1 receives it (subscribed to "file:abc-123")
+  → Server 1 pushes to Browser via WebSocket ✅
+```
+
+#### How it works in code
+
+```
+Browser side (one connection per file upload):
+  const ws = new WebSocket('ws://api:3000')
+  ws.send(JSON.stringify({ fileId }))        // tell server which file to watch
+  ws.onmessage = (e) => updateUI(e.data)     // update chip when pushed
+
+Server side (runs on every API instance):
+  const localWatchers = new Map()            // fileId → WebSocket (this server only)
+  const redisSub = new Redis()               // one connection per server for subscribing
+
+  // when browser connects
+  localWatchers.set(fileId, ws)
+  redisSub.subscribe(`file:${fileId}`)       // tell Redis to notify this server
+
+  // when Redis delivers a message
+  redisSub.on('message', (channel, msg) => {
+    const ws = localWatchers.get(fileId)
+    if (ws) ws.send(msg)                     // push to browser
+  })
+
+Worker side (after writing to DynamoDB):
+  redis.publish(`file:${fileId}`, JSON.stringify({ processor, status, result }))
+```
+
+#### The complete scaled flow
+
+```
+1.  Browser uploads file → gets fileId
+2.  Browser opens WebSocket → sends { fileId }
+3.  Server 1 subscribes to Redis channel "file:abc-123"
+
+4.  Worker finishes on any server
+5.  Worker writes result to DynamoDB        (persistent state)
+6.  Worker publishes to Redis "file:abc-123" (real-time notification)
+
+7.  Redis delivers to Server 1 (subscribed)
+8.  Server 1 pushes update to Browser via WebSocket
+9.  Browser updates that processor chip instantly
+
+10. All 4 workers done → Browser closes WebSocket
+11. Server 1 unsubscribes from Redis "file:abc-123"
+```
+
+#### Why both DynamoDB and Redis are needed
+
+```
+DynamoDB alone:
+  persistent ✅ but browser must poll → delay ❌
+
+Redis alone:
+  instant ✅ but ephemeral — if browser disconnects and reconnects it misses everything ❌
+
+Together:
+  worker finishes
+    → DynamoDB  permanent record, queryable anytime, survives restarts ✅
+    → Redis     instant notification, zero delay ✅
+
+  browser reconnects after drop?
+    → GET /api/status/:fileId reads DynamoDB to catch up ✅
+    → re-subscribes WebSocket for remaining live updates ✅
+```
+
+---
+
+### 2. Status Page — Show Previous Uploads
+
+Currently the UI only shows files uploaded in the current browser session. If you refresh the page, the history is gone from the frontend (though DynamoDB still has the data).
+
+**The improvement:** Add a `GET /api/files` endpoint backed by a DynamoDB GSI (Global Secondary Index) that lists all recent uploads, so the status page loads previous files on refresh.
+
+---
+
+### 3. Dead Letter Queues (DLQ)
+
+If a worker crashes repeatedly while processing a message, SQS will keep redelivering it — potentially forever. A Dead Letter Queue captures messages that fail after a configured number of attempts.
+
+```
+queue-virus-scanner
+  maxReceiveCount: 3        if message fails 3 times
+        │
+        ▼
+queue-virus-scanner-dlq     message moved here for inspection
+```
+
+This prevents poison pill messages (malformed events that always crash the worker) from blocking the queue indefinitely.
+
+---
+
+### 4. Replace SNS + SQS with Kafka (at org scale)
+
+The current SNS + SQS fan-out requires someone to create and manage a dedicated queue for every new consumer. Adding a 5th processor means:
+
+1. Create a new SQS queue
+2. Subscribe it to the SNS topic
+3. Deploy infrastructure changes
+
+With **Apache Kafka (or AWS MSK)**, any new consumer simply creates a consumer group and starts reading the `file-events` topic independently — no infrastructure changes, no coordination with other teams:
+
+```
+SNS + SQS (current):          Kafka (at scale):
+  1 SNS topic                   1 Kafka topic: file-events
+  4 SQS queues (one per worker) 4 consumer groups (one per worker)
+  new worker = new queue        new worker = new consumer group
+             = infra change               = just config, no infra change
+```
+
+Kafka also enables **event replay** — if a new processor is added later, it can rewind and reprocess all historical file upload events without any re-uploads.
+
+Use Kafka when:
+- Multiple teams need to independently consume the same events
+- You need to replay historical events
+- Message volume exceeds what SQS handles comfortably
