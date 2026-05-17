@@ -44,12 +44,29 @@ async function uploadFile(file) {
   form.append('file', file);
 
   try {
+    // 1. Upload file — get fileId back
     const res = await fetch('/api/upload', { method: 'POST', body: form });
     if (!res.ok) throw new Error(await res.text());
-
     const { fileId, fileName } = await res.json();
+
+    // 2. Render card immediately with all pending (placeholder)
     renderFileCard(fileId, fileName, file.size, file.type);
-    startPolling(fileId);
+
+    // 3. GET current status immediately — catch anything already done
+    //    (fast workers may have finished before browser even gets here)
+    const statusRes = await fetch(`/api/status/${fileId}`);
+    if (statusRes.ok) {
+      const status = await statusRes.json();
+      updateFileCard(status);
+
+      // 4. Only start polling if still processing — no point polling if done
+      if (status.overallStatus === 'processing') {
+        startPolling(fileId);
+      }
+    } else {
+      // fallback — status not ready yet, start polling
+      startPolling(fileId);
+    }
   } catch (err) {
     alert('Upload failed: ' + err.message);
   } finally {
