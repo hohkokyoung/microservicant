@@ -8,42 +8,116 @@ Upload a file through the web UI and watch four independent worker services proc
 
 ## Architecture
 
+### Current Implementation (Polling)
+
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Browser                                                          │
-│  POST /api/upload ──► polls GET /api/status/:fileId every 2s     │
-└───────────┬──────────────────────────────────────────────────────┘
-            │
-            ▼
-┌───────────────────────┐
-│   API Service  :3000  │  Express + TypeScript
-│                       │
-│  1. Store file ───────────────────────────► S3 (file-uploads)
-│  2. Init status ──────────────────────────► DynamoDB (pending rows)
-│  3. Publish event ────────────────────────► SNS (file-events)
-│  4. Query status ◄────────────────────────── DynamoDB (on demand)
-└───────────────────────┘
-            │
-            │  SNS fan-out — one event delivered to 4 queues simultaneously
-            │
-     ┌──────┴────────────────────────────────────┐
-     │              │               │             │
-     ▼              ▼               ▼             ▼
-┌─────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐
-│  Virus  │  │ Thumbnail │  │ Metadata │  │ Storage  │
-│ Scanner │  │ Generator │  │ Indexer  │  │Optimizer │
-└────┬────┘  └─────┬─────┘  └────┬─────┘  └────┬─────┘
-     │              │              │              │
-     └──────────────┴──────────────┴──────────────┘
-                             │
-                             │  each worker writes result directly
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Browser                                                                  │
+│                                                                           │
+│  1. POST /api/upload                                                      │
+│  2. receives { fileId }                                                   │
+│  3. polls GET /api/status/:fileId every 2s until complete                │
+└────────────────────────────┬────────────────────────────────────────────┘
+                             │ POST /api/upload
                              ▼
-                        DynamoDB
-                   (file-processing table)
+              ┌──────────────────────────┐
+              │     API Service :3000    │
+              │                          │
+              │  1. store file ──────────────────────────► S3
+              │  2. init status ─────────────────────────► DynamoDB
+              │     (#meta row + 4x pending processor rows)
+              │  3. publish event ───────────────────────► SNS (file-events)
+              │  4. return { fileId } ───────────────────► Browser
+              │                          │
+              │  GET /api/status/:fileId │
+              │  queries DynamoDB ◄──────────────────────── Browser polling
+              └──────────────────────────┘
                              │
-                             │  API queries on demand — no polling loop
-                             ▼
-                          Browser
+                             │ SNS fan-out — one event → 4 queues simultaneously
+                             │
+              ┌──────────────┼───────────────────────────┐
+              ▼              ▼              ▼             ▼
+   queue-virus-scanner  queue-thumbnail  queue-metadata  queue-optimizer
+              │              │              │             │
+              ▼              ▼              ▼             ▼
+       virus-scanner   thumbnail-gen  metadata-indexer  storage-optimizer
+              │              │              │             │
+              │  each worker writes result row directly to DynamoDB
+              └──────────────┴──────────────┴─────────────┘
+                                      │
+                                      ▼
+                                  DynamoDB
+                             (file-processing table)
+                                      │
+                             API reads on demand
+                             per polling request
+                                      │
+                                      ▼
+                                   Browser
+```
+
+---
+
+### Improved Architecture (WebSocket + Redis — at scale)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Browser                                                                  │
+│                                                                           │
+│  1. POST /api/upload                                                      │
+│  2. receives { fileId }                                                   │
+│  3. opens WebSocket connection → sends { fileId }                        │
+│  4. GET /api/status/:fileId once (get current state immediately)         │
+│  5. waits for WebSocket pushes (one per processor as they finish)        │
+│  6. closes WebSocket when overallStatus = complete                       │
+└──────┬─────────────────────────────────────────┬────────────────────────┘
+       │ POST /api/upload                         │ WebSocket connect
+       ▼                                          ▼
+┌──────────────────────────────────────────────────────┐
+│                  API Service :3000                    │
+│                                                       │
+│  On upload:                                           │
+│    1. store file ──────────────────────────► S3       │
+│    2. init status ─────────────────────────► DynamoDB │
+│       (#meta + 4x pending rows)                       │
+│    3. publish event ───────────────────────► SNS      │
+│    4. return { fileId }                               │
+│                                                       │
+│  On WebSocket connect:                                │
+│    5. register fileId → localWatchers Map             │
+│    6. subscribe to Redis channel "file:{fileId}"      │
+│                                                       │
+│  On Redis message:                                    │
+│    7. push update to browser via WebSocket            │
+│                                                       │
+│  On GET /api/status/:fileId:                          │
+│    8. query DynamoDB → return current state           │
+└──────────────────────────────────────────────────────┘
+       │ SNS fan-out                      ▲ Redis pub/sub delivers
+       │                                  │ to subscribed server
+       ├──────────────┬───────────────────┼──────────────┐
+       ▼              ▼              ▼    │              ▼
+  queue-virus    queue-thumb    queue-meta│         queue-optimizer
+       │              │              │   │               │
+       ▼              ▼              ▼   │               ▼
+  virus-scanner  thumbnail-gen  metadata-│        storage-optimizer
+       │              │          indexer │               │
+       │   each worker:                  │               │
+       │   1. write result ─────────────────────────► DynamoDB
+       │   2. publish to Redis ──────────┘ ("file:{fileId}" channel)
+       └──────────────┴──────────────────┴───────────────┘
+                                    │
+                              ┌─────┴──────┐
+                              │   Redis    │ delivers to all
+                              │  Pub/Sub   │ subscribed servers
+                              └─────┬──────┘
+                                    │
+                              API pushes via WebSocket
+                                    │
+                                    ▼
+                                 Browser
+                          (chip updates instantly
+                           as each worker finishes)
 ```
 
 ---
