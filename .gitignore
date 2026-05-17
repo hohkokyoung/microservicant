@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# TypeScript compiled output
+dist/
+**/dist/
+
+# Environment files
+.env
+.env.local
+
+# Docker volumes
+data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
